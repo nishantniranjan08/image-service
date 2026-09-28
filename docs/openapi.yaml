@@ -1,0 +1,268 @@
+openapi: 3.0.3
+info:
+  title: Image Service API
+  version: 1.0.0
+  description: |
+    Upload, list, view/download and delete images. Image bytes live in S3,
+    metadata in DynamoDB. Served by API Gateway (REST) + AWS Lambda.
+
+    **Identity.** Locally, the caller is identified by the `X-User-Id` header.
+    In production this is replaced by a Cognito authorizer; the service reads
+    the verified `sub` claim instead of the header.
+servers:
+  - url: http://localhost:4566/_aws/execute-api/{apiId}/dev
+    description: LocalStack (the deploy script prints the exact URL and saves it to .api_url)
+    variables:
+      apiId:
+        default: your-api-id
+
+tags:
+  - name: images
+
+paths:
+  /images:
+    post:
+      tags: [images]
+      summary: Upload an image with metadata
+      description: |
+        Two modes, chosen by whether `image_base64` is present:
+
+        * **Inline** (files up to 4 MB): send the bytes base64-encoded. The image is
+          stored and returned as `AVAILABLE` (201).
+        * **Presigned** (any size up to 20 MB): omit `image_base64`. The response (202)
+          contains a presigned S3 URL; `PUT` the raw bytes to it with the returned
+          `Content-Type` header. An S3 trigger then verifies the file (size, real
+          image type) and flips the status from `PENDING` to `AVAILABLE`, or to
+          `REJECTED` (object deleted) if verification fails.
+
+        The file type is detected from the file's magic bytes; a declared
+        `content_type` that disagrees with the contents is rejected.
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UploadRequest" }
+            examples:
+              inline:
+                summary: Inline upload
+                value:
+                  image_base64: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC
+                  title: Sunset
+                  description: Golden hour at the beach
+                  tags: [travel, beach]
+                  file_name: sunset.png
+              presigned:
+                summary: Presigned upload (large files)
+                value:
+                  content_type: image/jpeg
+                  title: Mountains
+                  tags: [travel]
+      responses:
+        "201":
+          description: Stored (inline mode)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  image: { $ref: "#/components/schemas/Image" }
+        "202":
+          description: Metadata created; upload the bytes to `upload.url`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  image: { $ref: "#/components/schemas/Image" }
+                  upload: { $ref: "#/components/schemas/UploadInstructions" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+
+    get:
+      tags: [images]
+      summary: List images (filterable, paginated)
+      description: |
+        Returns `AVAILABLE` images. All filters combine with AND.
+
+        With `user_id`, results come from a DynamoDB GSI query and are sorted
+        newest first. Without it, the listing is a paginated table scan in
+        storage order (intended for browsing/admin).
+      parameters:
+        - { name: user_id, in: query, schema: { type: string }, description: Only images uploaded by this user }
+        - { name: tag, in: query, schema: { type: string }, description: Only images carrying this tag (case-insensitive) }
+        - name: content_type
+          in: query
+          schema: { type: string, enum: [image/jpeg, image/png, image/gif, image/webp] }
+        - name: created_from
+          in: query
+          description: Inclusive lower bound, ISO-8601 date or datetime (e.g. `2026-09-01` or `2026-09-01T10:00:00Z`)
+          schema: { type: string }
+        - name: created_to
+          in: query
+          description: Inclusive upper bound; a plain date includes that whole day
+          schema: { type: string }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: next_token, in: query, schema: { type: string }, description: Opaque cursor from the previous page }
+      responses:
+        "200":
+          description: A page of images
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageList" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+
+  /images/{image_id}:
+    parameters:
+      - name: image_id
+        in: path
+        required: true
+        schema: { type: string, pattern: "^[0-9a-f]{32}$" }
+    get:
+      tags: [images]
+      summary: View / download an image
+      description: |
+        Default: metadata plus short-lived presigned `view_url` (inline) and
+        `download_url` (attachment). URLs are `null` while an upload is pending.
+
+        `?download=true` (or `?view=true`) responds with a 302 redirect straight
+        to the file, so the link works directly in a browser or with `curl -L`.
+      parameters:
+        - { name: download, in: query, schema: { type: boolean }, description: Redirect to the file as an attachment }
+        - { name: view, in: query, schema: { type: boolean }, description: Redirect to the file for inline display }
+      responses:
+        "200":
+          description: Image metadata with presigned URLs
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageWithUrls" }
+        "302":
+          description: Redirect to the presigned S3 URL
+          headers:
+            Location: { schema: { type: string } }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The image is still being uploaded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [images]
+      summary: Delete an image (owner only)
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "204": { description: Deleted (metadata and file) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The caller does not own this image
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  parameters:
+    UserId:
+      name: X-User-Id
+      in: header
+      required: true
+      description: Caller identity (1-64 chars of letters, digits, `-`, `_`). Replaced by a Cognito authorizer in production.
+      schema: { type: string, example: alice }
+
+  schemas:
+    UploadRequest:
+      type: object
+      properties:
+        image_base64: { type: string, format: byte, description: "Inline mode: file bytes, base64 (data: URLs accepted)" }
+        content_type:
+          type: string
+          enum: [image/jpeg, image/png, image/gif, image/webp]
+          description: Required in presigned mode; optional (auto-detected) in inline mode
+        title: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 2000 }
+        tags:
+          type: array
+          maxItems: 10
+          items: { type: string, pattern: "^[a-z0-9_-]{1,30}$" }
+          description: Lower-cased and de-duplicated on save
+        file_name: { type: string, maxLength: 255, description: Used as the download file name }
+
+    Image:
+      type: object
+      properties:
+        image_id: { type: string, example: 3f2a9c1e5b7d4e8fa1c2d3e4f5a6b7c8 }
+        user_id: { type: string, example: alice }
+        title: { type: string }
+        description: { type: string }
+        tags: { type: array, items: { type: string } }
+        content_type: { type: string, example: image/png }
+        file_name: { type: string, nullable: true }
+        size_bytes: { type: integer, nullable: true }
+        status: { type: string, enum: [PENDING, AVAILABLE] }
+        created_at: { type: string, example: "2026-09-29T10:15:30.123456Z" }
+        updated_at: { type: string }
+
+    ImageWithUrls:
+      allOf:
+        - $ref: "#/components/schemas/Image"
+        - type: object
+          properties:
+            view_url: { type: string, nullable: true }
+            download_url: { type: string, nullable: true }
+            url_expires_in: { type: integer, example: 900 }
+
+    UploadInstructions:
+      type: object
+      properties:
+        method: { type: string, example: PUT }
+        url: { type: string, description: Presigned S3 URL }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          example: { Content-Type: image/jpeg }
+        expires_in: { type: integer, example: 900 }
+        max_bytes: { type: integer, example: 20971520 }
+
+    ImageList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/Image" } }
+        count: { type: integer }
+        next_token: { type: string, nullable: true, description: Pass back as `next_token` for the next page; null on the last page }
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details: { type: object }
+            request_id: { type: string }
+
+  responses:
+    ValidationError:
+      description: Invalid input
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or malformed caller identity
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Image not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PayloadTooLarge:
+      description: Inline upload too large; use presigned mode
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
