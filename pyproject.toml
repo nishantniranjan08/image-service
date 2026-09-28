@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image-service"
+version = "1.0.0"
+description = "Serverless image upload & storage service: API Gateway + Lambda + S3 + DynamoDB"
+requires-python = ">=3.8"
+dependencies = []  # boto3 is provided by the AWS Lambda runtime
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not integration'"
+markers = ["integration: end-to-end tests against a running LocalStack deployment (make test-integration)"]
+
+[tool.coverage.run]
+source = ["image_service"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 110
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["S101", "UP006", "UP007", "UP035"]
