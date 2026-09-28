@@ -1,0 +1,25 @@
+services:
+  localstack:
+    container_name: image-service-localstack
+    # LocalStack images published from March 2026 need a (free) auth token.
+    # 4.4.0 is a pinned community release that runs without one. To use the
+    # newest image instead:  LOCALSTACK_IMAGE=localstack/localstack:latest
+    #                        LOCALSTACK_AUTH_TOKEN=<token>  docker compose up -d
+    image: ${LOCALSTACK_IMAGE:-localstack/localstack:4.4.0}
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      - SERVICES=s3,dynamodb,lambda,apigateway,iam,sts,logs
+      - AWS_DEFAULT_REGION=us-east-1
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN:-}
+      # Keep Lambda containers warm between invocations (faster local demo).
+      - LAMBDA_KEEPALIVE_MS=600000
+      - DEBUG=${DEBUG:-0}
+    volumes:
+      # LocalStack runs each Lambda in its own container, so it needs the Docker socket.
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
